@@ -1,0 +1,13 @@
+obj-intel64/
+pin/
+pin.tar.gz
+*.tar.gz
+edge-profile.csv
+edge-profile.opt.csv
+edge-profile.noopt.csv
+input-long.txt.bz2
+bprofile.out
+ex4.zip
+t_*.txt
+stderr_*.txt
+bprofile.orig.cpp

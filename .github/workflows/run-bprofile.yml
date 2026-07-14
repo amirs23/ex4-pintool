@@ -1,0 +1,147 @@
+name: Build and Measure bprofile (Pin 4.0)
+
+on: [push]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+
+    - name: Download Pin 4.0
+      run: |
+        wget -q https://software.intel.com/sites/landingpage/pintool/downloads/pin-external-4.0-99633-g5ca9893f2-gcc-linux.tar.gz -O pin.tar.gz
+        tar -xzf pin.tar.gz
+        mv pin-external-4.0-* pin
+
+    - name: Build bprofile.so
+      run: |
+        PIN_ROOT=$(pwd)/pin
+        PINCC=${PIN_ROOT}/intel64/pinrt/bin/pin-g++
+        mkdir -p obj-intel64
+        ${PINCC} \
+          -std=c++17 \
+          -Wall -Wno-unknown-pragmas \
+          -fno-stack-protector -fno-exceptions \
+          -funwind-tables -fasynchronous-unwind-tables \
+          -fno-rtti -fPIC -faligned-new \
+          -O3 -fomit-frame-pointer -fno-strict-aliasing \
+          -I${PIN_ROOT}/source/include/pin \
+          -I${PIN_ROOT}/source/include/pin/gen \
+          -I${PIN_ROOT}/extras/components/include \
+          -I${PIN_ROOT}/extras/xed-intel64/include/xed \
+          -I${PIN_ROOT}/source/tools/InstLib \
+          -isystem ${PIN_ROOT}/intel64/pinrt/include/adaptor \
+          -shared -Wl,-Bsymbolic \
+          -Wl,--version-script=${PIN_ROOT}/source/include/pin/pintool.ver \
+          -o obj-intel64/bprofile.so src/bprofile.cpp \
+          -L${PIN_ROOT}/intel64/lib \
+          -L${PIN_ROOT}/intel64/pinrt/lib \
+          -L${PIN_ROOT}/extras/xed-intel64/lib \
+          -lpin -lpinrt-adaptor-static -lxed -lpindwarf -ldwarf -lunwind-dynamic
+        echo "Build OK:"; ls -la obj-intel64/bprofile.so
+
+    - name: Make inputs executable
+      run: chmod +x bzip2
+
+    - name: Correctness — run optimized tool on bzip2, inspect edge-profile.csv
+      run: |
+        PIN_ROOT=$(pwd)/pin
+        echo "=== optimized run (short prof window) ==="
+        "${PIN_ROOT}/pin" -t obj-intel64/bprofile.so -prof_time 5 -- \
+          ./bzip2 -k -f input-long.txt 2> stderr_opt.txt || true
+        rm -f input-long.txt.bz2
+        echo "--- tail of Pin stderr ---"; tail -n 8 stderr_opt.txt || true
+        if [ -f edge-profile.csv ]; then
+          echo "edge-profile.csv: $(wc -l < edge-profile.csv) lines"
+          echo "--- first 15 lines (hottest BBLs) ---"
+          head -n 15 edge-profile.csv
+          echo "--- lines that carry indirect targets (>=5 fields) ---"
+          awk -F',' 'NF>=6{print; c++} c>=5{exit}' edge-profile.csv || true
+          cp edge-profile.csv edge-profile.opt.csv
+        else
+          echo "FAILED: edge-profile.csv not generated"; exit 1
+        fi
+
+    - name: Correctness — non-optimized produces the SAME profile
+      run: |
+        PIN_ROOT=$(pwd)/pin
+        rm -f edge-profile.csv
+        "${PIN_ROOT}/pin" -t obj-intel64/bprofile.so -prof_time 5 -dead_reg_opt 0 -- \
+          ./bzip2 -k -f input-long.txt 2>/dev/null || true
+        rm -f input-long.txt.bz2
+        if [ -f edge-profile.csv ]; then
+          cp edge-profile.csv edge-profile.noopt.csv
+          if diff -q edge-profile.opt.csv edge-profile.noopt.csv >/dev/null; then
+            echo "IDENTICAL profiles with and without the optimization (correctness OK)"
+          else
+            echo "WARNING: profiles differ between opt and non-opt"
+            diff edge-profile.opt.csv edge-profile.noopt.csv | head -n 20 || true
+          fi
+        else
+          echo "FAILED: non-opt run produced no edge-profile.csv"; exit 1
+        fi
+
+    - name: Performance — A/B timing (optimized vs non-optimized)
+      run: |
+        PIN_ROOT=$(pwd)/pin
+        PTIME=600     # keep profiling active for the whole run
+
+        run_timed () {   # $1=label  $2=opt(0/1)
+          local best=99999
+          for i in 1 2 3; do
+            rm -f edge-profile.csv input-long.txt.bz2
+            /usr/bin/time -v -o t_$1_$i.txt \
+              "${PIN_ROOT}/pin" -t obj-intel64/bprofile.so -prof_time ${PTIME} -dead_reg_opt $2 -- \
+              ./bzip2 -k -f input-long.txt 2>/dev/null || true
+            local u=$(grep "User time" t_$1_$i.txt | grep -oE '[0-9.]+' | head -1)
+            echo "  $1 run $i: user=${u}s"
+          done
+        }
+
+        echo "=== NON-OPTIMIZED (dead_reg_opt 0) ==="
+        run_timed noopt 0
+        echo "=== OPTIMIZED (dead_reg_opt 1) ==="
+        run_timed opt 1
+
+        echo ""
+        echo "=== Metrics (best-of-3 minima) ==="
+        python3 - <<'PY'
+        import glob, re
+        def best(label, field):
+            vals=[]
+            for f in glob.glob(f"t_{label}_*.txt"):
+                s=open(f).read()
+                m=re.search(field+r".*?([0-9.]+)", s)
+                if m: vals.append(float(m.group(1)))
+            return min(vals) if vals else None
+        fields = {
+          "User time (s)":        "User time",
+          "System time (s)":      "System time",
+          "Elapsed wall (s)":     "Elapsed .wall clock.",
+          "Max RSS (KB)":         "Maximum resident set size",
+          "Minor page faults":    "Minor .reclaiming a frame. page faults",
+          "Major page faults":    "Major .requiring I/O. page faults",
+        }
+        print(f"{'metric':22}{'no-opt':>14}{'opt':>14}{'improvement':>14}")
+        for name,pat in fields.items():
+            a=best("noopt",pat); b=best("opt",pat)
+            if a and b and a>0:
+                imp=100.0*(a-b)/a
+                print(f"{name:22}{a:>14.3f}{b:>14.3f}{imp:>13.2f}%")
+            else:
+                print(f"{name:22}{str(a):>14}{str(b):>14}{'n/a':>14}")
+        PY
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: bprofile-results
+        path: |
+          obj-intel64/bprofile.so
+          edge-profile.opt.csv
+          edge-profile.noopt.csv
+          t_*.txt

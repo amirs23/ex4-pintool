@@ -1,0 +1,9 @@
+##############################################################
+# Build rules for the ex4 bprofile pintool.
+##############################################################
+
+# The pintool to build (produces obj-intel64/bprofile.so).
+TEST_TOOL_ROOTS := bprofile
+
+# The tool uses C++11 features (lambdas, std::vector, range-based loops).
+TOOL_CXXFLAGS += -std=c++17
