@@ -103,6 +103,14 @@ KNOB<BOOL> KnobNoProfile(KNOB_MODE_WRITEONCE,    "pintool",
 KNOB<BOOL> KnobDeadRegOpt(KNOB_MODE_WRITEONCE,    "pintool",
     "dead_reg_opt", "1", "Skip save/restore of dead scratch registers");
 
+// Debug bisect knobs (default on): isolate which insertion site the
+// optimization is applied to. opt_bbl = per-BBL counter stub, opt_ft =
+// fall-through counter stub.
+KNOB<BOOL> KnobOptBbl(KNOB_MODE_WRITEONCE, "pintool",
+    "opt_bbl", "1", "Apply dead-reg opt at the per-BBL counter stub");
+KNOB<BOOL> KnobOptFt(KNOB_MODE_WRITEONCE, "pintool",
+    "opt_ft", "1", "Apply dead-reg opt at the fall-through counter stub");
+
 
 /* ===================================================================== */
 /* Global Variables */
@@ -740,13 +748,25 @@ static const unsigned char LIVE_ALL = LIVE_RAX | LIVE_RBX | LIVE_RCX;
 // instruction address -> scratch regs live on entry to that instruction.
 static std::map<ADDRINT, unsigned char> live_before_map;
 
-// Does 'ins' fully overwrite 'reg64' (a 32- or 64-bit write) without reading
-// it?  A 32-bit write zero-extends and therefore kills the whole 64-bit reg; a
-// read-modify or a partial 8/16-bit write does NOT kill it.
-static bool ins_kills_reg(INS ins, REG reg64)
+// Does 'ins' read any register of the reg64 family (RAX/EAX/AX/AL/AH for RAX)?
+// We iterate the read registers explicitly and compare full-register names,
+// which unambiguously catches 32/16/8-bit sub-register reads (e.g. EAX) that a
+// single REG_RAX overlap query might miss.
+static bool ins_reads_reg(INS ins, REG reg64)
 {
-    if (INS_RegRContain(ins, reg64))
-        return false;                        // read-modify -> still live
+    UINT32 nr = INS_MaxNumRRegs(ins);
+    for (UINT32 i = 0; i < nr; i++) {
+        if (REG_FullRegName(INS_RegR(ins, i)) == reg64)
+            return true;
+    }
+    return false;
+}
+
+// Does 'ins' fully overwrite 'reg64' (a 32- or 64-bit write)?  A 32-bit write
+// zero-extends and therefore kills the whole 64-bit reg; a partial 8/16-bit
+// write does NOT.
+static bool ins_writes_full(INS ins, REG reg64)
+{
     UINT32 nw = INS_MaxNumWRegs(ins);
     for (UINT32 i = 0; i < nw; i++) {
         REG w = INS_RegW(ins, i);
@@ -756,12 +776,24 @@ static bool ins_kills_reg(INS ins, REG reg64)
     return false;
 }
 
+// A register is KILLED (its old value becomes dead) only by a full write that
+// does not also read it. Predicated writes (cmovcc, rep-strings) may preserve
+// the destination, so they are conservatively treated as NON-killing.
+static bool ins_kills_reg(INS ins, REG reg64)
+{
+    if (INS_IsPredicated(ins))
+        return false;
+    if (ins_reads_reg(ins, reg64))
+        return false;                        // read-modify -> still live
+    return ins_writes_full(ins, reg64);
+}
+
 static unsigned char ins_use_mask(INS ins)
 {
     unsigned char m = 0;
-    if (INS_RegRContain(ins, LEVEL_BASE::REG_RAX)) m |= LIVE_RAX;
-    if (INS_RegRContain(ins, LEVEL_BASE::REG_RBX)) m |= LIVE_RBX;
-    if (INS_RegRContain(ins, LEVEL_BASE::REG_RCX)) m |= LIVE_RCX;
+    if (ins_reads_reg(ins, LEVEL_BASE::REG_RAX)) m |= LIVE_RAX;
+    if (ins_reads_reg(ins, LEVEL_BASE::REG_RBX)) m |= LIVE_RBX;
+    if (ins_reads_reg(ins, LEVEL_BASE::REG_RCX)) m |= LIVE_RCX;
     return m;
 }
 
@@ -1662,7 +1694,8 @@ int find_candidate_rtns_for_tc(IMG img)
                   if (isInsTerminatesBBL) {
                     // ex4: RAX/RBX/RCX liveness on entry to the terminator tells
                     // add_profiling_instrs which scratch regs must be preserved.
-                    unsigned char lm = KnobDeadRegOpt ? live_mask_at(ins_addr) : LIVE_ALL;
+                    unsigned char lm = (KnobDeadRegOpt && KnobOptBbl)
+                                       ? live_mask_at(ins_addr) : LIVE_ALL;
                     rc = add_profiling_instrs(ins, ins_addr, &bbl_map[bbl_num].counter, bbl_num, lm);
                     if (rc < 0)
                       return -1;
@@ -1698,7 +1731,7 @@ int find_candidate_rtns_for_tc(IMG img)
                 if (!KnobNoProfile && INS_Category(ins) == XED_CATEGORY_COND_BR) {
                   // The fall-through stub runs just before the fall-through
                   // instruction, so use that instruction's liveness.
-                  unsigned char lm = (KnobDeadRegOpt && INS_Valid(next_ins))
+                  unsigned char lm = (KnobDeadRegOpt && KnobOptFt && INS_Valid(next_ins))
                                      ? live_mask_at(INS_Address(next_ins)) : LIVE_ALL;
                   rc = add_profiling_instrs(ins, ins_addr,
                                             &bbl_map[bbl_num - 1].fallthru_counter, bbl_num-1, lm);

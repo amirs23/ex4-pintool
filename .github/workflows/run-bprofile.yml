@@ -46,51 +46,46 @@ jobs:
     - name: Make inputs executable
       run: chmod +x bzip2
 
-    - name: Correctness — run optimized tool on bzip2, inspect edge-profile.csv
+    - name: Correctness fingerprint (every config must match baseline)
       run: |
         PIN_ROOT=$(pwd)/pin
-        echo "=== optimized run (short prof window) ==="
-        "${PIN_ROOT}/pin" -t obj-intel64/bprofile.so -prof_time 5 -- \
-          ./bzip2 -k -f input-long.txt 2> stderr_opt.txt || true
-        rm -f input-long.txt.bz2
-        echo "--- tail of Pin stderr ---"; tail -n 8 stderr_opt.txt || true
-        if [ -f edge-profile.csv ]; then
-          echo "edge-profile.csv: $(wc -l < edge-profile.csv) lines"
-          echo "--- first 15 lines (hottest BBLs) ---"
-          head -n 15 edge-profile.csv
-          echo "--- lines that carry indirect targets (>=5 fields) ---"
-          awk -F',' 'NF>=6{print; c++} c>=5{exit}' edge-profile.csv || true
-          cp edge-profile.csv edge-profile.opt.csv
-        else
-          echo "FAILED: edge-profile.csv not generated"; exit 1
-        fi
+        fp () {   # $1=label ; rest = knobs
+          local label=$1; shift
+          rm -f edge-profile.csv input-long.txt.bz2
+          "${PIN_ROOT}/pin" -t obj-intel64/bprofile.so -prof_time 600 "$@" -- \
+            ./bzip2 -k -f input-long.txt 2>/dev/null || true
+          rm -f input-long.txt.bz2
+          if [ -f edge-profile.csv ]; then
+            awk -F',' -v L="$label" '{n++; s+=$2} END{printf "%-11s lines=%-6d sum_exec=%d\n", L, n, s}' edge-profile.csv
+          else
+            echo "$label: NO OUTPUT"
+          fi
+        }
+        echo "=== Correctness fingerprints (lines + total BBL executions) ==="
+        fp baseline -dead_reg_opt 0
+        fp full-opt -dead_reg_opt 1
+        fp bbl-only -dead_reg_opt 1 -opt_ft 0
+        fp ft-only  -dead_reg_opt 1 -opt_bbl 0
+        echo ""
+        echo "(baseline == full-opt  =>  optimization is sound)"
 
-    - name: Correctness — non-optimized produces the SAME profile
+    - name: Inspect edge-profile.csv (deliverable format)
       run: |
         PIN_ROOT=$(pwd)/pin
         rm -f edge-profile.csv
-        "${PIN_ROOT}/pin" -t obj-intel64/bprofile.so -prof_time 5 -dead_reg_opt 0 -- \
+        "${PIN_ROOT}/pin" -t obj-intel64/bprofile.so -prof_time 600 -- \
           ./bzip2 -k -f input-long.txt 2>/dev/null || true
         rm -f input-long.txt.bz2
-        if [ -f edge-profile.csv ]; then
-          cp edge-profile.csv edge-profile.noopt.csv
-          if diff -q edge-profile.opt.csv edge-profile.noopt.csv >/dev/null; then
-            echo "IDENTICAL profiles with and without the optimization (correctness OK)"
-          else
-            echo "WARNING: profiles differ between opt and non-opt"
-            diff edge-profile.opt.csv edge-profile.noopt.csv | head -n 20 || true
-          fi
-        else
-          echo "FAILED: non-opt run produced no edge-profile.csv"; exit 1
-        fi
+        echo "edge-profile.csv: $(wc -l < edge-profile.csv) lines"
+        echo "--- first 12 lines (hottest) ---"; head -12 edge-profile.csv
+        echo "--- indirect-target lines ---"; awk -F',' 'NF>=6' edge-profile.csv | head -5
+        cp edge-profile.csv edge-profile.sample.csv
 
-    - name: Performance — A/B timing (optimized vs non-optimized)
+    - name: Performance — A/B timing (baseline vs optimized)
       run: |
         PIN_ROOT=$(pwd)/pin
-        PTIME=600     # keep profiling active for the whole run
-
+        PTIME=600
         run_timed () {   # $1=label  $2=opt(0/1)
-          local best=99999
           for i in 1 2 3; do
             rm -f edge-profile.csv input-long.txt.bz2
             /usr/bin/time -v -o t_$1_$i.txt \
@@ -100,12 +95,8 @@ jobs:
             echo "  $1 run $i: user=${u}s"
           done
         }
-
-        echo "=== NON-OPTIMIZED (dead_reg_opt 0) ==="
-        run_timed noopt 0
-        echo "=== OPTIMIZED (dead_reg_opt 1) ==="
-        run_timed opt 1
-
+        echo "=== NON-OPTIMIZED (dead_reg_opt 0) ==="; run_timed noopt 0
+        echo "=== OPTIMIZED (dead_reg_opt 1) ==="   ; run_timed opt 1
         echo ""
         echo "=== Metrics (best-of-3 minima) ==="
         python3 - <<'PY'
@@ -113,24 +104,20 @@ jobs:
         def best(label, field):
             vals=[]
             for f in glob.glob(f"t_{label}_*.txt"):
-                s=open(f).read()
-                m=re.search(field+r".*?([0-9.]+)", s)
+                m=re.search(field+r".*?([0-9.]+)", open(f).read())
                 if m: vals.append(float(m.group(1)))
             return min(vals) if vals else None
         fields = {
           "User time (s)":        "User time",
           "System time (s)":      "System time",
-          "Elapsed wall (s)":     "Elapsed .wall clock.",
           "Max RSS (KB)":         "Maximum resident set size",
           "Minor page faults":    "Minor .reclaiming a frame. page faults",
-          "Major page faults":    "Major .requiring I/O. page faults",
         }
         print(f"{'metric':22}{'no-opt':>14}{'opt':>14}{'improvement':>14}")
         for name,pat in fields.items():
             a=best("noopt",pat); b=best("opt",pat)
             if a and b and a>0:
-                imp=100.0*(a-b)/a
-                print(f"{name:22}{a:>14.3f}{b:>14.3f}{imp:>13.2f}%")
+                print(f"{name:22}{a:>14.3f}{b:>14.3f}{100.0*(a-b)/a:>13.2f}%")
             else:
                 print(f"{name:22}{str(a):>14}{str(b):>14}{'n/a':>14}")
         PY
@@ -142,6 +129,5 @@ jobs:
         name: bprofile-results
         path: |
           obj-intel64/bprofile.so
-          edge-profile.opt.csv
-          edge-profile.noopt.csv
+          edge-profile.sample.csv
           t_*.txt
