@@ -122,6 +122,61 @@ jobs:
                 print(f"{name:22}{str(a):>14}{str(b):>14}{'n/a':>14}")
         PY
 
+    - name: Compare vs ex2 JIT edge profile (README req 4 data)
+      run: |
+        PIN_ROOT=$(pwd)/pin
+        chmod +x ex2.so || true
+
+        # ex2 (JIT, whole run, no prof_time window)
+        rm -f edge-profile.csv input-long.txt.bz2
+        "${PIN_ROOT}/pin" -t ex2.so -- ./bzip2 -k -f input-long.txt 2>/dev/null || true
+        rm -f input-long.txt.bz2
+        mv edge-profile.csv edge-profile.ex2.csv 2>/dev/null || echo "ex2 produced no csv"
+
+        # bprofile (probe, whole run since prof_time huge)
+        rm -f edge-profile.csv input-long.txt.bz2
+        "${PIN_ROOT}/pin" -t obj-intel64/bprofile.so -prof_time 600 -- ./bzip2 -k -f input-long.txt 2>/dev/null || true
+        rm -f input-long.txt.bz2
+        mv edge-profile.csv edge-profile.bp.csv 2>/dev/null || true
+
+        # bprofile with a SHORT window to show the prof_time-windowing effect
+        rm -f edge-profile.csv input-long.txt.bz2
+        "${PIN_ROOT}/pin" -t obj-intel64/bprofile.so -prof_time 1 -- ./bzip2 -k -f input-long.txt 2>/dev/null || true
+        rm -f input-long.txt.bz2
+        mv edge-profile.csv edge-profile.bp_t1.csv 2>/dev/null || true
+
+        echo "=== line counts ==="
+        for f in edge-profile.ex2.csv edge-profile.bp.csv edge-profile.bp_t1.csv; do
+          [ -f "$f" ] && echo "$f: $(wc -l < $f) lines"
+        done
+
+        echo ""
+        echo "=== same hot BBL, counted by each tool (addr, ex2_exec, bprofile_exec, bprofile_t1_exec) ==="
+        python3 - <<'PY'
+        import csv
+        def load(fn):
+            d={}
+            try:
+                for row in csv.reader(open(fn)):
+                    if len(row)>=2:
+                        try: d[row[0].strip()]=int(row[1])
+                        except: pass
+            except FileNotFoundError: pass
+            return d
+        ex2=load("edge-profile.ex2.csv"); bp=load("edge-profile.bp.csv"); bp1=load("edge-profile.bp_t1.csv")
+        top=sorted(bp.items(), key=lambda kv:-kv[1])[:12]
+        print(f"{'addr':12}{'ex2':>14}{'bprofile':>14}{'bp_t1':>14}")
+        for a,c in top:
+            print(f"{a:12}{str(ex2.get(a,'-')):>14}{c:>14}{str(bp1.get(a,'-')):>14}")
+        common=set(ex2)&set(bp)
+        print(f"\nBBL addresses: ex2={len(ex2)}  bprofile={len(bp)}  common={len(common)}  "
+              f"only-ex2={len(set(ex2)-set(bp))}  only-bp={len(set(bp)-set(ex2))}")
+        if bp and bp1:
+            sb=sum(bp.values()); s1=sum(bp1.values())
+            print(f"total execs: bprofile(full)={sb}  bprofile(prof_time=1)={s1}  "
+                  f"=> short window captures {100.0*s1/sb:.1f}%")
+        PY
+
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
       if: always()
@@ -130,4 +185,7 @@ jobs:
         path: |
           obj-intel64/bprofile.so
           edge-profile.sample.csv
+          edge-profile.ex2.csv
+          edge-profile.bp.csv
+          edge-profile.bp_t1.csv
           t_*.txt
