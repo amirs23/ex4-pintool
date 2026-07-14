@@ -1,0 +1,201 @@
+Full Name: Sari Morkos
+ID:        325390078
+
+Full Name: Amir Said
+ID:        212247365
+
+================================================================
+ex4 - Optimizing the bprofile.cpp Probe-mode Pintool
+================================================================
+
+bprofile.cpp is an Intel Pin 4.0 PROBE-mode pintool. It translates every
+routine of the main executable into an allocated Translation Cache (TC) and
+injects, into each basic block (BBL), hand-encoded profiling instructions that
+count:
+  - how many times the BBL executed,
+  - for a BBL ending in a conditional branch, how many times it fell through,
+  - for a BBL ending in an indirect jump, the distribution of its targets.
+An internal thread disables the profiling after -prof_time seconds by patching
+a bypass jump over each profiling stub.
+
+
+=== (a) How to Run the Tool ===
+
+Build (Pin 4.0):
+
+    cd src
+    make PIN_ROOT=/path/to/pin
+    # produces obj-intel64/bprofile.so   (submitted as ex4.so-equivalent: bprofile.so)
+
+Run on any of the exercise-3 input binaries, e.g. bzip2:
+
+    $PIN_ROOT/pin -t obj-intel64/bprofile.so -prof_time 5 -- ./bzip2 -k -f input-long.txt
+
+    $PIN_ROOT/pin -t bprofile.so -prof_time 2 -- ./cpugcc_r_base.Oz-m64 200.i -o 200.s
+
+Output: edge-profile.csv (see format below).
+
+Useful knobs:
+    -prof_time <seconds>   how long profiling stays active (default 2)
+    -dead_reg_opt <0|1>    enable the ex4 optimization (default 1). 0 reproduces
+                           the original always-save/restore behaviour, for A/B timing.
+    -opt_bbl / -opt_ft     (debug) enable the optimization at the per-BBL counter
+                           stub / the fall-through-counter stub independently.
+
+
+=== edge-profile.csv format ===
+
+One line per executed BBL, sorted from hottest to coldest:
+
+    <bbl addr>, <exec count>, <taken count>, <fallthru count>
+        [, <targ addr>, <targ count> ...  up to 4 indirect targets, hottest first]
+
+  taken count    = exec count - fallthru count
+  fallthru count = number of fall-throughs (non-zero only for conditional tails)
+  The indirect-target fields are present only for BBLs ending in an indirect jump.
+
+Example (hottest BBL of bzip2):  0x40a78b, 149695665, 148638693, 1056972
+  (148638693 taken + 1056972 fall-through = 149695665 total executions)
+
+
+=== (b/c) Problems Fixed and How ===
+
+--- Part 1: make the tool run on ALL exercise-3 input binaries ---
+
+The provided bprofile.cpp is built on the same (broken) probe-mode translation
+engine as the exercise-3 btranslate.cpp and contained the same 5 bugs. It
+crashed with a Segmentation fault on the larger binaries (e.g.
+cpugcc_r_base.Oz-m64). We applied the same fixes we found in exercise 3:
+
+  1. Off-by-one in fix_direct_jmp_or_call_to_orig_addr: the index into
+     jump_to_orig_addr_map was incremented BEFORE being used, so slot 0 was
+     wasted and the de-duplication scan never matched, overflowing the map.
+     Fix: assign the index, store, THEN increment.
+
+  2. Missing RTN_IsSafeForProbedReplacement check in commit: routines shorter
+     than the 5-byte probe trampoline were replaced anyway, corrupting adjacent
+     code. Fix: skip routines that are not safe for probed replacement.
+
+  3. Double replacement of _exit: create_tc runs per image, and _exit is found
+     both in libc and as the main binary's PLT stub. Replacing it twice made
+     origExit point back at the probed stub -> infinite recursion. Fix: probe
+     _exit only once (guard origExit == NULL) plus a NULL check before calling it.
+
+  4. Wrong XED call order in fix_rip_displacement: set_memory_displacement was
+     called BEFORE xed_encoder_request_init_from_decode, which reset the encoder
+     and discarded the corrected RIP displacement. Fix: init_from_decode first,
+     then set the displacement.
+
+  5. Translating PLT stubs (and _init): relocating a "<sym>@plt" stub into the TC
+     breaks lazy dynamic-symbol resolution (crash in _dl_fixup). Fix: skip
+     routines whose name ends in "@plt", and skip _init (its translated code
+     SIGILLs on some binaries).
+
+--- Part 2: the optimization - avoid saving/restoring DEAD registers ---
+
+The profiling stubs use RAX (always), and RBX + RCX (only for indirect-target
+profiling), as scratch registers, and save/restore them through memory around
+every counter update. The counter increment itself is written with LEA (not
+INC/ADD) specifically so it does not touch RFLAGS, so flags never need saving.
+
+Saving and restoring a scratch register that is DEAD at the instrumentation
+point (i.e. the application overwrites it before ever reading it again) is pure
+overhead. We added an intra-routine liveness analysis and skip the save/restore
+of the dead ones:
+
+  - compute_rtn_liveness(rtn) runs a backward "may-be-live" data-flow over the
+    routine for RAX/RBX/RCX, computing which of them are live on entry to each
+    instruction. It is CONSERVATIVE: wherever control may leave the routine
+    (ret / indirect branch / call / branch to an address outside the routine /
+    end of routine) all three registers are assumed live, so a needed
+    save/restore is never dropped.
+
+  - add_profiling_instrs() receives this live mask and emits the save/restore of
+    only the live registers. The register is still used as scratch either way;
+    only its preservation is skipped when it is dead.
+
+  - The per-BBL counter stub uses the liveness at the BBL terminator; the
+    fall-through counter stub uses the liveness at the fall-through instruction.
+
+Correctness of the analysis is essential: if a live register were wrongly
+treated as dead, the stub would clobber the program's value and corrupt its
+execution. During bring-up this exact bug occurred - the first version used
+INS_RegRContain(ins, REG_RAX), which did not reliably report reads of the 32-bit
+sub-register EAX (which compiled C code uses constantly), so RAX was marked dead
+while still live and bzip2 executed ~60x fewer basic blocks. We fixed it by
+detecting reads/writes explicitly: iterate INS_RegR / INS_RegW and compare
+REG_FullRegName against the target 64-bit register (this catches EAX/AX/AL
+reads), a 32/64-bit write is a "kill", and predicated writes (cmov / rep) are
+treated as NON-killing.
+
+We verified soundness on GitHub Actions (Linux x86-64): with and without the
+optimization the tool produces a byte-identical edge profile (843 BBLs,
+4,058,923,524 total BBL executions on bzip2 + input-long.txt), i.e. the
+optimization does not change what is measured, only how fast it is measured.
+
+--- Output: edge-profile.csv instead of bprofile.out ---
+
+The original tool dumped a human-readable listing to bprofile.out. We replaced
+this with dump_edge_profile_csv(), which writes edge-profile.csv in the format
+above, sorted from hottest to coldest (assuming < 10,000 BBLs). The old dump is
+still available behind the -dump_prof knob.
+
+
+=== (c) Performance improvement (-prof_time, vs the non-optimized version) ===
+
+Measured on GitHub Actions (ubuntu-latest, x86-64), bzip2 compressing the 20 MB
+input-long.txt, profiling active for the whole run, best-of-3:
+
+    metric            non-optimized      optimized     improvement
+    User time              10.20 s          8.71 s        14.6 %
+    System time             0.32 s          0.30 s         6.3 %
+
+The user-time improvement is consistently 12-15 % across runs, comfortably above
+the required 5 %. "non-optimized" is the SAME binary run with -dead_reg_opt 0
+(reproducing the original always-save/restore behaviour), so the comparison is
+exactly the optimization and nothing else.
+
+
+=== (d) Large differences vs the profiling collected in the previous exercise ===
+
+We compared this probe-mode profile against the JIT-mode edge profile from the
+previous edge-profiling exercise (ex2.so), both on bzip2 + input-long.txt. The
+main differences and why they happen:
+
+  1. COVERAGE / SCOPE.
+     The previous JIT tool instruments every image that executes (the main
+     binary AND libc, the dynamic linker, PLT stubs, ...): 4744 distinct BBLs.
+     bprofile only translates and profiles the MAIN EXECUTABLE (create_tc
+     returns early for non-main images) and additionally skips PLT stubs, _init
+     and any routine that is unsafe for probed replacement: 843 BBLs. Of these,
+     811 are common; 3933 BBLs appear only in the JIT profile (they live in libc
+     / the loader), and 32 appear only in bprofile.
+     Reason: probe mode rewrites only the code it can safely translate in place,
+     whereas JIT instrumentation sees all executed code.
+
+  2. THE -prof_time WINDOW.
+     bprofile stops counting after -prof_time seconds. On this workload a 1-second
+     window captured only 11.8 % of the total BBL executions (477,917,418 of
+     4,058,923,524) and recorded only 692 of the 843 BBLs - the hot blocks are
+     undercounted ~8x and the blocks that only run late are missed entirely. The
+     JIT tool profiles the whole run, so its counts are complete and larger.
+     Reason: bprofile is a sampling profiler with a time budget; the previous
+     tool is an exhaustive profiler.
+
+  3. BASIC-BLOCK BOUNDARIES.
+     Probe-mode bprofile starts a new BBL at every direct-branch target and after
+     every control-transfer instruction (its own translation), while the JIT tool
+     uses Pin's trace/BBL model. Where the two disagree, the same address is
+     entered a different number of times. For example the hottest block 0x40a78b
+     is counted 149,695,665 times by bprofile but 116,355,574 times by the JIT
+     tool, and 32 blocks exist only under bprofile's splitting. Most other hot
+     blocks match exactly (e.g. 0x40a7c3 = 148,638,693 in both).
+     Reason: the two frameworks define "basic block" slightly differently.
+
+  4. INDIRECT-TARGET REPRESENTATION.
+     bprofile stores at most 4 indirect targets, bucketed by (target & 3); when
+     two real targets collide in a bucket their counts merge and the stored
+     address is the last writer. The previous tool kept up to 10 exact distinct
+     targets. So for polymorphic indirect jumps the target lists differ.
+     Reason: bprofile trades precision for a tiny fixed-size, lock-free counter
+     table that its in-line stub can update cheaply.
