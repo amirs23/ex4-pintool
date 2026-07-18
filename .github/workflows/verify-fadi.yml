@@ -1,0 +1,85 @@
+name: Verify fadi's bprofile (soundness + sgcc behavior)
+
+on: [push]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+
+    - name: Download Pin 4.0
+      run: |
+        wget -q https://software.intel.com/sites/landingpage/pintool/downloads/pin-external-4.0-99633-g5ca9893f2-gcc-linux.tar.gz -O pin.tar.gz
+        tar -xzf pin.tar.gz
+        mv pin-external-4.0-* pin
+
+    - name: Build fadi's tool
+      run: |
+        PIN_ROOT=$(pwd)/pin
+        PINCC=${PIN_ROOT}/intel64/pinrt/bin/pin-g++
+        mkdir -p obj-intel64
+        ${PINCC} -std=c++17 -Wall -Wno-unknown-pragmas \
+          -fno-stack-protector -fno-exceptions -funwind-tables -fasynchronous-unwind-tables \
+          -fno-rtti -fPIC -faligned-new -O3 -fomit-frame-pointer -fno-strict-aliasing \
+          -I${PIN_ROOT}/source/include/pin -I${PIN_ROOT}/source/include/pin/gen \
+          -I${PIN_ROOT}/extras/components/include -I${PIN_ROOT}/extras/xed-intel64/include/xed \
+          -I${PIN_ROOT}/source/tools/InstLib -isystem ${PIN_ROOT}/intel64/pinrt/include/adaptor \
+          -shared -Wl,-Bsymbolic -Wl,--version-script=${PIN_ROOT}/source/include/pin/pintool.ver \
+          -o obj-intel64/fadi.so bprofile_fadi.cpp \
+          -L${PIN_ROOT}/intel64/lib -L${PIN_ROOT}/intel64/pinrt/lib -L${PIN_ROOT}/extras/xed-intel64/lib \
+          -lpin -lpinrt-adaptor-static -lxed -lpindwarf -ldwarf -lunwind-dynamic
+        echo "built:"; ls -la obj-intel64/fadi.so
+
+    - name: chmod inputs
+      run: chmod +x bzip2 sgcc_base.mytest-m64
+
+    - name: bzip2 soundness — default(opt) vs -force_live_all(noopt) fingerprint
+      run: |
+        PIN_ROOT=$(pwd)/pin
+        fp () {  # $1=label ; rest=knobs
+          local label=$1; shift
+          rm -f edge-profile.csv input-long.txt.bz2
+          "${PIN_ROOT}/pin" -t obj-intel64/fadi.so -prof_time 600 "$@" -- ./bzip2 -k -f input-long.txt 2>fadi_bzip2_${label// /_}.err || true
+          rm -f input-long.txt.bz2
+          [ -f edge-profile.csv ] && awk -F',' -v L="$label" '{n++;s+=$2} END{printf "%-22s lines=%-6d sum_exec=%d\n",L,n,s}' edge-profile.csv || echo "$label: NO OUTPUT"
+          [ -f edge-profile.csv ] && cp edge-profile.csv "edge-profile_${label// /_}.csv"
+        }
+        echo "=== bzip2 ==="
+        fp "fadi default(opt)"
+        fp "fadi force_live_all(noopt)" -force_live_all
+        echo ""
+        echo "=== diff (should be identical if the liveness optimization is sound) ==="
+        diff "edge-profile_fadi_default(opt).csv" "edge-profile_fadi_force_live_all(noopt).csv" && echo "IDENTICAL - sound" || echo "DIFFER - see above, potential soundness issue"
+
+    - name: sgcc_base — reproduce their claimed crash (both configs)
+      run: |
+        PIN_ROOT=$(pwd)/pin
+        run_sgcc () {  # $1=label ; rest=knobs
+          local label=$1; shift
+          rm -f edge-profile.csv 200.s
+          timeout 240 "${PIN_ROOT}/pin" -t obj-intel64/fadi.so -prof_time 600 "$@" -- \
+            ./sgcc_base.mytest-m64 200.i -o 200.s > /dev/null 2> sgcc_fadi_${label// /_}.err || true
+          echo "--- $label ---"
+          grep -iE "after commit|Invalid rip|unsupported|ERROR|abort|Segmentation" sgcc_fadi_${label// /_}.err | head -4 || true
+          if [ -f edge-profile.csv ]; then
+            awk -F',' -v L="$label" '{n++;s+=$2} END{printf "  %s: edge-profile.csv lines=%d sum_exec=%d\n",L,n,s}' edge-profile.csv
+          else
+            echo "  $label: NO edge-profile.csv (translation/profiling aborted)"
+          fi
+        }
+        echo "=== sgcc_base.mytest-m64 ==="
+        run_sgcc "default(opt)"
+        run_sgcc "force_live_all(noopt)"
+        run_sgcc "no_prof" -no_prof
+
+    - name: Upload
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: verify-fadi-results
+        path: |
+          fadi_bzip2_*.err
+          sgcc_fadi_*.err
+          edge-profile_*.csv
