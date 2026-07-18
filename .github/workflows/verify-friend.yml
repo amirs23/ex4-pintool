@@ -74,14 +74,19 @@ jobs:
         run_sgcc obj-intel64/ours.so   ours_sgcc
         run_sgcc obj-intel64/friend.so friend_sgcc
         echo ""
-        echo "=== partner's tool: sgcc soundness (opt vs non-opt) ==="
-        rm -f edge-profile.csv 200.s
-        timeout 240 "${PIN_ROOT}/pin" -t obj-intel64/friend.so -prof_time 600 -dead_reg_opt 0 -- ./sgcc_base.mytest-m64 200.i -o 200.s 2>/dev/null || true
-        [ -f edge-profile.csv ] && awk -F',' '{n++;s+=$2} END{printf "  friend sgcc noopt: lines=%d sum_exec=%d\n",n,s}' edge-profile.csv
-        cp -f edge-profile.csv sgcc_friend_noopt.csv 2>/dev/null || true
-        rm -f edge-profile.csv 200.s
-        timeout 240 "${PIN_ROOT}/pin" -t obj-intel64/friend.so -prof_time 600 -dead_reg_opt 1 -- ./sgcc_base.mytest-m64 200.i -o 200.s 2>/dev/null || true
-        [ -f edge-profile.csv ] && awk -F',' '{n++;s+=$2} END{printf "  friend sgcc opt:   lines=%d sum_exec=%d\n",n,s}' edge-profile.csv
+        echo "=== partner's tool on sgcc: is it self-consistent? (same config twice) ==="
+        sg () {  # $1=label ; rest=knobs
+          local label=$1; shift
+          rm -f edge-profile.csv 200.s
+          timeout 300 "${PIN_ROOT}/pin" -t obj-intel64/friend.so -prof_time 600 "$@" -- \
+            ./sgcc_base.mytest-m64 200.i -o 200.s 2>/dev/null || true
+          [ -f edge-profile.csv ] && awk -F',' -v L="$label" '{n++;s+=$2} END{printf "  %-18s lines=%d sum_exec=%d\n",L,n,s}' edge-profile.csv || echo "  $label: NO OUTPUT"
+        }
+        sg "noopt run A" -dead_reg_opt 0
+        sg "noopt run B" -dead_reg_opt 0
+        sg "opt   run A" -dead_reg_opt 1
+        sg "opt   run B" -dead_reg_opt 1
+        echo "(if noopt-A != noopt-B, sgcc itself is non-deterministic and the opt/noopt gap is noise)"
 
     - name: Upload
       uses: actions/upload-artifact@v4
