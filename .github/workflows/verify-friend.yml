@@ -1,0 +1,93 @@
+name: Verify partner's bprofile (ours vs theirs)
+
+on: [push]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+
+    - name: Download Pin 4.0
+      run: |
+        wget -q https://software.intel.com/sites/landingpage/pintool/downloads/pin-external-4.0-99633-g5ca9893f2-gcc-linux.tar.gz -O pin.tar.gz
+        tar -xzf pin.tar.gz
+        mv pin-external-4.0-* pin
+
+    - name: Build both tools (ours + partner's)
+      run: |
+        PIN_ROOT=$(pwd)/pin
+        PINCC=${PIN_ROOT}/intel64/pinrt/bin/pin-g++
+        mkdir -p obj-intel64
+        build () {  # $1 = src  $2 = out.so
+          ${PINCC} -std=c++17 -Wall -Wno-unknown-pragmas \
+            -fno-stack-protector -fno-exceptions -funwind-tables -fasynchronous-unwind-tables \
+            -fno-rtti -fPIC -faligned-new -O3 -fomit-frame-pointer -fno-strict-aliasing \
+            -I${PIN_ROOT}/source/include/pin -I${PIN_ROOT}/source/include/pin/gen \
+            -I${PIN_ROOT}/extras/components/include -I${PIN_ROOT}/extras/xed-intel64/include/xed \
+            -I${PIN_ROOT}/source/tools/InstLib -isystem ${PIN_ROOT}/intel64/pinrt/include/adaptor \
+            -shared -Wl,-Bsymbolic -Wl,--version-script=${PIN_ROOT}/source/include/pin/pintool.ver \
+            -o $2 $1 \
+            -L${PIN_ROOT}/intel64/lib -L${PIN_ROOT}/intel64/pinrt/lib -L${PIN_ROOT}/extras/xed-intel64/lib \
+            -lpin -lpinrt-adaptor-static -lxed -lpindwarf -ldwarf -lunwind-dynamic
+        }
+        build src/bprofile.cpp      obj-intel64/ours.so     && echo "ours.so built"
+        build bprofile_friend.cpp   obj-intel64/friend.so   && echo "friend.so built"
+
+    - name: chmod inputs
+      run: chmod +x bzip2 sgcc_base.mytest-m64
+
+    - name: bzip2 soundness — both tools, opt vs non-opt fingerprint
+      run: |
+        PIN_ROOT=$(pwd)/pin
+        fp () {  # $1=tool.so  $2=label ; rest=knobs
+          local so=$1 label=$2; shift 2
+          rm -f edge-profile.csv input-long.txt.bz2
+          "${PIN_ROOT}/pin" -t $so -prof_time 600 "$@" -- ./bzip2 -k -f input-long.txt 2>/dev/null || true
+          rm -f input-long.txt.bz2
+          [ -f edge-profile.csv ] && awk -F',' -v L="$label" '{n++;s+=$2} END{printf "%-22s lines=%-6d sum_exec=%d\n",L,n,s}' edge-profile.csv || echo "$label: NO OUTPUT"
+        }
+        echo "=== bzip2 ==="
+        fp obj-intel64/ours.so   "ours   noopt" -dead_reg_opt 0
+        fp obj-intel64/ours.so   "ours   opt"   -dead_reg_opt 1
+        fp obj-intel64/friend.so "friend noopt" -dead_reg_opt 0
+        fp obj-intel64/friend.so "friend opt"   -dead_reg_opt 1
+
+    - name: sgcc_base — does each tool survive translation? (Fix 6/7)
+      run: |
+        PIN_ROOT=$(pwd)/pin
+        run_sgcc () {  # $1=tool.so $2=label ; rest=knobs
+          local so=$1 label=$2; shift 2
+          rm -f edge-profile.csv 200.s
+          timeout 240 "${PIN_ROOT}/pin" -t $so -prof_time 600 "$@" -- \
+            ./sgcc_base.mytest-m64 200.i -o 200.s > /dev/null 2> sgcc_${label}.err || true
+          echo "--- $label ---"
+          grep -iE "after commit|Invalid rip|unsupported|ERROR|abort|Segmentation" sgcc_${label}.err | head -4 || true
+          if [ -f edge-profile.csv ]; then
+            awk -F',' -v L="$label" '{n++;s+=$2} END{printf "  %s: edge-profile.csv lines=%d sum_exec=%d\n",L,n,s}' edge-profile.csv
+          else
+            echo "  $label: NO edge-profile.csv (translation likely aborted)"
+          fi
+        }
+        echo "=== sgcc_base.mytest-m64 (exercises conditional-branch-to-orig + PIE paths) ==="
+        run_sgcc obj-intel64/ours.so   ours_sgcc
+        run_sgcc obj-intel64/friend.so friend_sgcc
+        echo ""
+        echo "=== partner's tool: sgcc soundness (opt vs non-opt) ==="
+        rm -f edge-profile.csv 200.s
+        timeout 240 "${PIN_ROOT}/pin" -t obj-intel64/friend.so -prof_time 600 -dead_reg_opt 0 -- ./sgcc_base.mytest-m64 200.i -o 200.s 2>/dev/null || true
+        [ -f edge-profile.csv ] && awk -F',' '{n++;s+=$2} END{printf "  friend sgcc noopt: lines=%d sum_exec=%d\n",n,s}' edge-profile.csv
+        cp -f edge-profile.csv sgcc_friend_noopt.csv 2>/dev/null || true
+        rm -f edge-profile.csv 200.s
+        timeout 240 "${PIN_ROOT}/pin" -t obj-intel64/friend.so -prof_time 600 -dead_reg_opt 1 -- ./sgcc_base.mytest-m64 200.i -o 200.s 2>/dev/null || true
+        [ -f edge-profile.csv ] && awk -F',' '{n++;s+=$2} END{printf "  friend sgcc opt:   lines=%d sum_exec=%d\n",n,s}' edge-profile.csv
+
+    - name: Upload
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: verify-results
+        path: |
+          sgcc_*.err
+          sgcc_friend_noopt.csv
