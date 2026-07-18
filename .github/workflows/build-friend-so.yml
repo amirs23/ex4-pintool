@@ -1,0 +1,34 @@
+name: Build partner bprofile.so (fresh)
+
+on: [push]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Download Pin 4.0
+      run: |
+        wget -q https://software.intel.com/sites/landingpage/pintool/downloads/pin-external-4.0-99633-g5ca9893f2-gcc-linux.tar.gz -O pin.tar.gz
+        tar -xzf pin.tar.gz
+        mv pin-external-4.0-* pin
+    - name: Build bprofile.so from partner's source
+      run: |
+        PIN_ROOT=$(pwd)/pin
+        PINCC=${PIN_ROOT}/intel64/pinrt/bin/pin-g++
+        mkdir -p obj-intel64
+        ${PINCC} -std=c++17 -Wall -Wno-unknown-pragmas \
+          -fno-stack-protector -fno-exceptions -funwind-tables -fasynchronous-unwind-tables \
+          -fno-rtti -fPIC -faligned-new -O3 -fomit-frame-pointer -fno-strict-aliasing \
+          -I${PIN_ROOT}/source/include/pin -I${PIN_ROOT}/source/include/pin/gen \
+          -I${PIN_ROOT}/extras/components/include -I${PIN_ROOT}/extras/xed-intel64/include/xed \
+          -I${PIN_ROOT}/source/tools/InstLib -isystem ${PIN_ROOT}/intel64/pinrt/include/adaptor \
+          -shared -Wl,-Bsymbolic -Wl,--version-script=${PIN_ROOT}/source/include/pin/pintool.ver \
+          -o obj-intel64/bprofile.so bprofile_friend.cpp \
+          -L${PIN_ROOT}/intel64/lib -L${PIN_ROOT}/intel64/pinrt/lib -L${PIN_ROOT}/extras/xed-intel64/lib \
+          -lpin -lpinrt-adaptor-static -lxed -lpindwarf -ldwarf -lunwind-dynamic
+        echo "built:"; ls -la obj-intel64/bprofile.so
+    - uses: actions/upload-artifact@v4
+      with:
+        name: friend-bprofile-so
+        path: obj-intel64/bprofile.so
